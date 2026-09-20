@@ -247,6 +247,96 @@ def annotation_counts(data_dir, test_dir):
     return rows
 
 
+
+def transform_rotated(arr, gts, angle_deg):
+    import cv2
+    h, w = arr.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    rotated = cv2.warpAffine(arr, M, (w, h), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    out = []
+    for cls, b in gts:
+        x1, y1, x2, y2 = map(float, b)
+        pts = np.array([[x1, y1, 1.0], [x2, y1, 1.0],
+                        [x2, y2, 1.0], [x1, y2, 1.0]], dtype=float)
+        t = pts @ M.T
+        nx1 = max(0.0, float(t[:, 0].min()))
+        ny1 = max(0.0, float(t[:, 1].min()))
+        nx2 = min(float(w), float(t[:, 0].max()))
+        ny2 = min(float(h), float(t[:, 1].max()))
+        if nx2 > nx1 and ny2 > ny1:
+            out.append((cls, np.array([nx1, ny1, nx2, ny2], dtype=float)))
+    return rotated, out
+
+
+def robustness_evaluation(model, test_dir, imgsz, nms_iou, match_iou, device,
+                          confidence=0.40):
+    import cv2
+
+    conditions = {
+        "normal": [],
+        "low_illumination_50pct": [],
+        "partial_head_occlusion": [],
+        "pose_rotation_10deg": [],
+        "crowded_ge_3_persons": [],
+    }
+
+    imgs = images_in(test_dir / "images")
+    for idx, img in enumerate(imgs):
+        arr = cv2.imread(str(img))
+        if arr is None:
+            continue
+        h, w = arr.shape[:2]
+        gts = labels_for(test_dir / "labels" / f"{img.stem}.txt", w, h)
+        person_boxes = [b for c, b in gts if c == 5]
+
+        conditions["normal"].append((arr, gts))
+
+        low = np.clip(arr.astype(np.float32) * 0.50, 0, 255).astype(np.uint8)
+        conditions["low_illumination_50pct"].append((low, gts))
+
+        occ = arr.copy()
+        for pb in person_boxes:
+            x1, y1, x2, y2 = [int(round(v)) for v in pb]
+            y_occ2 = y1 + max(1, int(round((y2 - y1) * 0.35)))
+            x1c, x2c = max(0, x1), min(w - 1, x2)
+            y1c, y2c = max(0, y1), min(h - 1, y_occ2)
+            if x2c > x1c and y2c > y1c:
+                cv2.rectangle(occ, (x1c, y1c), (x2c, y2c), (0, 0, 0), -1)
+        conditions["partial_head_occlusion"].append((occ, gts))
+
+        angle = 10.0 if idx % 2 == 0 else -10.0
+        rot, rgts = transform_rotated(arr, gts, angle)
+        conditions["pose_rotation_10deg"].append((rot, rgts))
+
+        if len(person_boxes) >= 3:
+            conditions["crowded_ge_3_persons"].append((arr, gts))
+
+    rows = []
+    for name, samples in conditions.items():
+        TP = FP = FN = 0
+        for arr, gts in samples:
+            res = model.predict(source=arr, imgsz=imgsz, conf=confidence,
+                                iou=nms_iou, device=device, verbose=False)[0]
+            preds = []
+            if res.boxes is not None:
+                xyxy = res.boxes.xyxy.detach().cpu().numpy()
+                confs = res.boxes.conf.detach().cpu().numpy()
+                clss = res.boxes.cls.detach().cpu().numpy().astype(int)
+                preds = [(int(c), float(cf), b.astype(float))
+                         for b, cf, c in zip(xyxy, confs, clss)]
+            tp, fp, fn = match(preds, gts, confidence, match_iou,
+                               COMPLIANCE_CLASS_IDS)
+            TP += tp
+            FP += fp
+            FN += fn
+        row = prf(TP, FP, FN, confidence)
+        row = {"condition": name, "images": len(samples), **row}
+        rows.append(row)
+    return rows
+
+
 def main():
     a = args()
     import cv2
@@ -338,6 +428,12 @@ def main():
             target.append(prf(TP, FP, FN, t))
     dump_csv(out/"threshold_sweep_all_classes.csv", all_rows)
     dump_csv(out/"threshold_sweep_compliance_classes.csv", compliance_rows)
+
+    robust_rows = robustness_evaluation(
+        model, test_dir, a.imgsz, a.nms_iou, a.match_iou, a.device, confidence=0.40
+    )
+    dump_csv(out/"robustness_metrics.csv", robust_rows)
+
 
     # Reviewer robustness table: make a manifest, but do not invent semantic
     # labels such as occlusion or pose. Those require manual visual assignment.
